@@ -1,0 +1,21 @@
+# build artifacts
+*.o
+*.obj
+*.a
+*.lib
+*.exe
+*.out
+a.out
+
+# editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# python
+__pycache__/
+*.pyc
+
+# bench output (user regenerates as needed)
+/bench/*.log
