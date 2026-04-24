@@ -24,4 +24,25 @@ int mul(std::uint64_t* rp,
 // rp[0..2*an) = ap[0..an)^2
 int sqr(std::uint64_t* rp, const std::uint64_t* ap, std::ptrdiff_t an);
 
+// Experimental runtime digit width path. Inputs and outputs remain little-endian
+// 64-bit limbs; trunk_bits selects the internal base-2^trunk_bits digit stream.
+// trunk_bits must be in [1, 16]. The 16-bit case dispatches to mul/sqr.
+int mul_bits(std::uint64_t* rp,
+             const std::uint64_t* ap, std::ptrdiff_t an,
+             const std::uint64_t* bp, std::ptrdiff_t bn,
+             unsigned trunk_bits);
+
+int sqr_bits(std::uint64_t* rp,
+             const std::uint64_t* ap, std::ptrdiff_t an,
+             unsigned trunk_bits);
+
+// Delegate entry: choose 16/15/14/13-bit trunks from the selected transform
+// length band, up to N = 2^23.
+int mul_auto(std::uint64_t* rp,
+             const std::uint64_t* ap, std::ptrdiff_t an,
+             const std::uint64_t* bp, std::ptrdiff_t bn);
+
+int sqr_auto(std::uint64_t* rp,
+             const std::uint64_t* ap, std::ptrdiff_t an);
+
 }  // namespace fft

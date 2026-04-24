@@ -19,3 +19,6 @@ __pycache__/
 
 # bench output (user regenerates as needed)
 /bench/*.log
+
+# local agent instructions
+/AGENTS.md
