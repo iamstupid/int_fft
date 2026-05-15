@@ -6,7 +6,8 @@
 // into an N/2-point complex transform, combined with a prime-factor (Good-
 // Thomas) extension that supports N = M·2^L for M ∈ {1, 3, 5, 7}.
 //
-// Max supported: either operand up to ~16384 limbs (65536-point FFT).
+// Fixed 16-bit mul/sqr support up to ~16384 limbs. mul_auto/sqr_auto then use
+// wide U16, centered U16 up to 2^17 u64 limbs, and finally the U14 FFT band.
 #pragma once
 
 #include <cstddef>
@@ -24,9 +25,9 @@ int mul(std::uint64_t* rp,
 // rp[0..2*an) = ap[0..an)^2
 int sqr(std::uint64_t* rp, const std::uint64_t* ap, std::ptrdiff_t an);
 
-// Experimental runtime digit width path. Inputs and outputs remain little-endian
+// Experimental fixed digit-width path. Inputs and outputs remain little-endian
 // 64-bit limbs; trunk_bits selects the internal base-2^trunk_bits digit stream.
-// trunk_bits must be in [1, 16]. The 16-bit case dispatches to mul/sqr.
+// trunk_bits must be 14, 15, or 16. The 16-bit case dispatches to mul/sqr.
 int mul_bits(std::uint64_t* rp,
              const std::uint64_t* ap, std::ptrdiff_t an,
              const std::uint64_t* bp, std::ptrdiff_t bn,
@@ -36,8 +37,8 @@ int sqr_bits(std::uint64_t* rp,
              const std::uint64_t* ap, std::ptrdiff_t an,
              unsigned trunk_bits);
 
-// Delegate entry: choose 16/15/14/13-bit trunks from the selected transform
-// length band, up to N = 2^23.
+// Delegate entry: choose 16/wide-16/15/14-bit trunks from the selected
+// transform length band, up to N = 2^21.
 int mul_auto(std::uint64_t* rp,
              const std::uint64_t* ap, std::ptrdiff_t an,
              const std::uint64_t* bp, std::ptrdiff_t bn);
@@ -96,8 +97,6 @@ constexpr double W7_RE[7] = {
 constexpr double W7_IM[7] = {
     0.0, -0.78183148246802981, -0.97492791218182361, -0.43388373911755812, 0.43388373911755812, 0.97492791218182361, 0.78183148246802981
 };
-
-// ==================== fft.cpp (inlined) =====================================
 
 // int_fft: double-precision complex FFT for bigint multiplication (AVX2+FMA).
 // One forward, one inverse, one PQ pointwise multiply, one PQ pointwise square.
@@ -426,6 +425,49 @@ FFT_INLINE cv load_u16_pair(const std::uint64_t* src, std::size_t limb_count,
     return out;
 }
 
+FFT_INLINE cv load_u16_centered_pair(const std::uint64_t* src,
+                                     std::size_t limb_count,
+                                     std::uint32_t digit_idx)
+{
+    const __m128i even_mask = _mm_setr_epi8(0, 1, 4, 5, 8, 9, 12, 13,
+                                            -128, -128, -128, -128, -128, -128, -128, -128);
+    const __m128i odd_mask  = _mm_setr_epi8(2, 3, 6, 7, 10, 11, 14, 15,
+                                            -128, -128, -128, -128, -128, -128, -128, -128);
+    assert((digit_idx & 3u) == 0);
+    std::size_t limb_idx = std::size_t(digit_idx >> 1);
+
+    if (limb_idx >= limb_count)
+        return { zero4(), zero4() };
+
+    __m128i v;
+    bool full = limb_idx + 1u < limb_count;
+    if (full)
+        v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + limb_idx));
+    else
+        v = _mm_set_epi64x(0, static_cast<long long>(src[limb_idx]));
+
+    __m128i vr = _mm_shuffle_epi8(v, even_mask);
+    __m128i vi = _mm_shuffle_epi8(v, odd_mask);
+    __m256i r32 = _mm256_cvtepu16_epi32(vr);
+    __m256i i32 = _mm256_cvtepu16_epi32(vi);
+
+    const __m256i center = _mm256_set1_epi32(32768);
+    if (full) {
+        r32 = _mm256_sub_epi32(r32, center);
+        i32 = _mm256_sub_epi32(i32, center);
+    } else {
+        const __m256i valid = _mm256_setr_epi32(-1, -1, 0, 0, -1, -1, 0, 0);
+        const __m256i c = _mm256_and_si256(center, valid);
+        r32 = _mm256_sub_epi32(r32, c);
+        i32 = _mm256_sub_epi32(i32, c);
+    }
+
+    cv out;
+    out.re = _mm256_cvtepi32_pd(_mm256_castsi256_si128(r32));
+    out.im = _mm256_cvtepi32_pd(_mm256_castsi256_si128(i32));
+    return out;
+}
+
 struct U16Codec {
     static constexpr bool needs_partial_clear = false;
 
@@ -458,61 +500,43 @@ struct U16Codec {
                                     std::size_t result_limbs) const;
 };
 
-FFT_INLINE std::uint64_t low_mask_u64(unsigned bits) {
-    return bits == 64u ? ~std::uint64_t(0) : ((std::uint64_t(1) << bits) - 1u);
-}
+struct U16WideCodec : U16Codec {
+    static constexpr bool needs_partial_clear = false;
 
-FFT_INLINE std::uint64_t load_bits_u64(const std::uint64_t* src,
-                                       std::size_t limb_count,
-                                       std::size_t bit, unsigned bits)
-{
-    assert(bits <= 64u);
-    std::size_t word = bit >> 6;
-    unsigned shift = unsigned(bit & 63u);
-    std::uint64_t lo = word < limb_count ? src[word] : 0;
-    std::uint64_t x = lo >> shift;
-    if (shift != 0u) {
-        std::uint64_t hi = word + 1u < limb_count ? src[word + 1u] : 0;
-        x |= hi << (64u - shift);
+    FFT_INLINE std::size_t partial_count(std::size_t result_limbs) const {
+        return result_limbs;
     }
-    return x & low_mask_u64(bits);
-}
 
-struct RuntimeBitStream {
-    const std::uint64_t* src;
-    std::size_t limb_count;
-    std::size_t limb_idx;
-    unsigned fill = 0;
-    unsigned __int128 stream = 0;
+    FFT_INLINE void emit_tile(unsigned __int128* partial,
+                              std::size_t partial_n,
+                              std::size_t tile_idx, cv x,
+                              vec4 zero, __m256i bias_bits, vec4 bias52) const;
 
-    RuntimeBitStream(const std::uint64_t* src_, std::size_t limb_count_,
-                     std::size_t limb_idx_)
-        : src(src_), limb_count(limb_count_), limb_idx(limb_idx_)
-    {}
+    FFT_INLINE int partial_to_limbs(std::uint64_t* rp,
+                                    const unsigned __int128* partial,
+                                    std::size_t partial_n,
+                                    std::size_t result_limbs) const;
+};
 
-    FFT_INLINE std::uint64_t next_limb()
+struct CenteredU16Codec {
+    FFT_INLINE cv load_pair4(const std::uint64_t* src, std::size_t limb_count,
+                             std::uint32_t pair_index) const
     {
-        std::uint64_t x = limb_idx < limb_count ? src[limb_idx] : 0;
-        ++limb_idx;
-        return x;
+        return load_u16_centered_pair(src, limb_count, pair_index);
     }
 
-    FFT_INLINE std::uint64_t take(unsigned bits)
+    FFT_INLINE cv load_pair4_encoded(const std::uint64_t* src, std::size_t limb_count,
+                                     std::uint32_t encoded_pair_index) const
     {
-        while (fill < bits) {
-            stream |= static_cast<unsigned __int128>(next_limb()) << fill;
-            fill += 64u;
-        }
-        std::uint64_t out = static_cast<std::uint64_t>(stream) & low_mask_u64(bits);
-        stream >>= bits;
-        fill -= bits;
-        return out;
+        return load_pair4(src, limb_count, (encoded_pair_index & ~7u) >> 1);
     }
+
+    FFT_INLINE void reset_input_cache() const {}
 };
 
 template <unsigned Bits>
-struct RuntimeBitStreamFixed {
-    static_assert(Bits > 0u && Bits < 16u, "runtime trunk width must be 1..15");
+struct FixedBitStream {
+    static_assert(Bits == 15u || Bits == 14u, "fixed trunk width must be U15 or U14");
     static constexpr unsigned group_bits = 4u * Bits;
     static constexpr std::uint64_t group_mask = (std::uint64_t(1) << group_bits) - 1u;
 
@@ -522,8 +546,8 @@ struct RuntimeBitStreamFixed {
     unsigned fill = 0;
     std::uint64_t stream = 0;
 
-    RuntimeBitStreamFixed(const std::uint64_t* src_, std::size_t limb_count_,
-                          std::size_t limb_idx_)
+    FixedBitStream(const std::uint64_t* src_, std::size_t limb_count_,
+                   std::size_t limb_idx_)
         : src(src_), limb_count(limb_count_), limb_idx(limb_idx_)
     {}
 
@@ -585,7 +609,7 @@ FFT_INLINE __m256i trunk_tile_shuffle_mask()
 template <unsigned Bits>
 FFT_INLINE __m256i unpack_trunk_tile_aosov(const std::uint8_t* p)
 {
-    static_assert(Bits >= 13u && Bits <= 15u, "SIMD tile unpack is for hot widths");
+    static_assert(Bits >= 14u && Bits <= 15u, "SIMD tile unpack is for hot widths");
     const __m256i bytes =
         _mm256_broadcastsi128_si256(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
     __m256i x = _mm256_shuffle_epi8(bytes, trunk_tile_shuffle_mask<Bits>());
@@ -595,58 +619,18 @@ FFT_INLINE __m256i unpack_trunk_tile_aosov(const std::uint8_t* p)
     return _mm256_permutevar8x32_epi32(x, aosov);
 }
 
-struct RuntimeBitsCodec {
-    static constexpr bool needs_partial_clear = true;
+struct FixedBitsBase {
+    static constexpr bool needs_partial_clear = false;
     static constexpr std::uint32_t input_cache_pairs = 64;
     static constexpr std::uint32_t input_cache_tiles = input_cache_pairs / 4u;
 
-    unsigned trunk_bits;
-    unsigned pair_bits;
-    unsigned group_bits;
-    std::uint64_t trunk_mask;
-    std::uint64_t pair_mask;
     mutable std::uint32_t max_pair[8] = {};
     alignas(32) mutable std::uint32_t input_cache[8][input_cache_tiles][8] = {};
-
-    explicit RuntimeBitsCodec(unsigned bits)
-        : trunk_bits(bits),
-          pair_bits(2u * bits),
-          group_bits(4u * bits),
-          trunk_mask(low_mask_u64(bits)),
-          pair_mask(low_mask_u64(2u * bits))
-    {
-        assert(bits > 0u && bits < 16u);
-    }
-
-    FFT_INLINE cv load_pair4(const std::uint64_t* src, std::size_t limb_count,
-                             std::uint32_t pair_index) const
-    {
-        return load_pair4_encoded(src, limb_count, pair_index << 1);
-    }
 
     FFT_INLINE void reset_input_cache() const
     {
         for (std::uint32_t i = 0; i < 8u; ++i)
             max_pair[i] = 0;
-    }
-
-    FFT_INLINE void store_cache_tile(unsigned tag, std::uint32_t t,
-                                     std::uint64_t g0, std::uint64_t g1) const
-    {
-        std::uint64_t p0 = g0 & pair_mask;
-        std::uint64_t p1 = g0 >> pair_bits;
-        std::uint64_t p2 = g1 & pair_mask;
-        std::uint64_t p3 = g1 >> pair_bits;
-
-        std::uint32_t* q = input_cache[tag][t];
-        q[0] = std::uint32_t(p0 & trunk_mask);
-        q[1] = std::uint32_t(p1 & trunk_mask);
-        q[2] = std::uint32_t(p2 & trunk_mask);
-        q[3] = std::uint32_t(p3 & trunk_mask);
-        q[4] = std::uint32_t((p0 >> trunk_bits) & trunk_mask);
-        q[5] = std::uint32_t((p1 >> trunk_bits) & trunk_mask);
-        q[6] = std::uint32_t((p2 >> trunk_bits) & trunk_mask);
-        q[7] = std::uint32_t((p3 >> trunk_bits) & trunk_mask);
     }
 
     template <unsigned Bits>
@@ -672,22 +656,6 @@ struct RuntimeBitsCodec {
         q[7] = std::uint32_t((p3 >> Bits) & tm);
     }
 
-    FFT_INLINE void refill_input_cache_generic(const std::uint64_t* src,
-                                               std::size_t limb_count,
-                                               unsigned tag,
-                                               std::uint32_t base_pair) const
-    {
-        std::size_t base_bit = std::size_t(base_pair) * pair_bits;
-        assert((base_bit & 63u) == 0);
-        RuntimeBitStream bits(src, limb_count, base_bit >> 6);
-
-        for (std::uint32_t t = 0; t < input_cache_tiles; ++t) {
-            std::uint64_t g0 = bits.take(group_bits);
-            std::uint64_t g1 = bits.take(group_bits);
-            store_cache_tile(tag, t, g0, g1);
-        }
-    }
-
     template <unsigned Bits>
     FFT_INLINE void refill_input_cache_fixed(const std::uint64_t* src,
                                              std::size_t limb_count,
@@ -696,7 +664,7 @@ struct RuntimeBitsCodec {
     {
         std::size_t base_bit = std::size_t(base_pair) * (2u * Bits);
         assert((base_bit & 63u) == 0);
-        RuntimeBitStreamFixed<Bits> bits(src, limb_count, base_bit >> 6);
+        FixedBitStream<Bits> bits(src, limb_count, base_bit >> 6);
 
         for (std::uint32_t t = 0; t < input_cache_tiles; ++t) {
             std::uint64_t g0 = bits.take();
@@ -717,6 +685,39 @@ struct RuntimeBitsCodec {
             _mm256_store_si256(reinterpret_cast<__m256i*>(input_cache[tag][t]), q);
         }
     }
+};
+
+template <int Lane>
+FFT_INLINE std::uint64_t extract_u64_lane(__m256i x)
+{
+    static_assert(Lane >= 0 && Lane < 4, "lane out of range");
+    if constexpr (Lane < 2)
+        return static_cast<std::uint64_t>(
+            _mm_extract_epi64(_mm256_castsi256_si128(x), Lane));
+    else
+        return static_cast<std::uint64_t>(
+            _mm_extract_epi64(_mm256_extracti128_si256(x, 1), Lane - 2));
+}
+
+template <unsigned Bits>
+struct FixedBitsCodec : FixedBitsBase {
+    static_assert(Bits == 15u || Bits == 14u, "fixed codec covers U15 and U14 only");
+    static constexpr bool needs_partial_clear = false;
+    static constexpr unsigned bit_width = Bits;
+    static constexpr unsigned pair_width = 2u * Bits;
+    static constexpr unsigned group_width = 4u * Bits;
+    static constexpr std::uint64_t pair_mask_fixed =
+        (std::uint64_t(1) << pair_width) - 1u;
+    static constexpr std::uint64_t group_mask_fixed =
+        (std::uint64_t(1) << group_width) - 1u;
+
+    FixedBitsCodec() = default;
+
+    FFT_INLINE cv load_pair4(const std::uint64_t* src, std::size_t limb_count,
+                             std::uint32_t pair_index) const
+    {
+        return load_pair4_encoded(src, limb_count, pair_index << 1);
+    }
 
     FFT_INLINE void refill_input_cache(const std::uint64_t* src,
                                        std::size_t limb_count,
@@ -725,33 +726,17 @@ struct RuntimeBitsCodec {
     {
         std::uint32_t base_pair = pair_index & ~(input_cache_pairs - 1u);
         max_pair[tag] = base_pair + input_cache_pairs;
-        std::size_t base_bit = std::size_t(base_pair) * pair_bits;
+        std::size_t base_bit = std::size_t(base_pair) * pair_width;
         assert((base_bit & 63u) == 0);
         std::size_t base_limb = base_bit >> 6;
 
-        switch (trunk_bits) {
-        case 15u:
-            if (base_limb + 31u <= limb_count)
-                refill_input_cache_simd<15>(src, tag, base_limb);
-            else
-                refill_input_cache_fixed<15>(src, limb_count, tag, base_pair);
-            break;
-        case 14u:
-            if (base_limb + 29u <= limb_count)
-                refill_input_cache_simd<14>(src, tag, base_limb);
-            else
-                refill_input_cache_fixed<14>(src, limb_count, tag, base_pair);
-            break;
-        case 13u:
-            if (base_limb + 27u <= limb_count)
-                refill_input_cache_simd<13>(src, tag, base_limb);
-            else
-                refill_input_cache_fixed<13>(src, limb_count, tag, base_pair);
-            break;
-        default:
-            refill_input_cache_generic(src, limb_count, tag, base_pair);
-            break;
-        }
+        constexpr std::size_t simd_bytes = 15u * Bits + 16u;
+        constexpr std::size_t simd_limbs = (simd_bytes + 7u) >> 3;
+        if (base_limb + simd_limbs <= limb_count)
+            this->template refill_input_cache_simd<Bits>(src, tag, base_limb);
+        else
+            this->template refill_input_cache_fixed<Bits>(src, limb_count,
+                                                          tag, base_pair);
     }
 
     FFT_INLINE cv load_pair4_encoded(const std::uint64_t* src,
@@ -772,32 +757,9 @@ struct RuntimeBitsCodec {
         };
     }
 
-    FFT_INLINE cv load_pair4_direct(const std::uint64_t* src, std::size_t limb_count,
-                                    std::uint32_t pair_index) const
-    {
-        std::size_t bit0 = std::size_t(pair_index) * pair_bits;
-        std::uint64_t g0 = load_bits_u64(src, limb_count, bit0, group_bits);
-        std::uint64_t g1 = load_bits_u64(src, limb_count, bit0 + 2u * pair_bits,
-                                         group_bits);
-
-        std::uint64_t p0 = g0 & pair_mask;
-        std::uint64_t p1 = g0 >> pair_bits;
-        std::uint64_t p2 = g1 & pair_mask;
-        std::uint64_t p3 = g1 >> pair_bits;
-
-        return {
-            set_r4(double(p0 & trunk_mask), double(p1 & trunk_mask),
-                   double(p2 & trunk_mask), double(p3 & trunk_mask)),
-            set_r4(double((p0 >> trunk_bits) & trunk_mask),
-                   double((p1 >> trunk_bits) & trunk_mask),
-                   double((p2 >> trunk_bits) & trunk_mask),
-                   double((p3 >> trunk_bits) & trunk_mask))
-        };
-    }
-
     FFT_INLINE std::size_t partial_count(std::size_t result_limbs) const {
         std::size_t result_bits = result_limbs * 64u;
-        return (result_bits + group_bits - 1u) / group_bits;
+        return (result_bits + group_width - 1u) / group_width;
     }
 
     FFT_INLINE void emit_tile(unsigned __int128* partial,
@@ -810,6 +772,9 @@ struct RuntimeBitsCodec {
                                     std::size_t partial_n,
                                     std::size_t result_limbs) const;
 };
+
+using U15Codec = FixedBitsCodec<15>;
+using U14Codec = FixedBitsCodec<14>;
 
 // -----------------------------------------------------------------------------
 // Final radix-2^2 tile: an in-tile 4-point DFT, done in SSE pairs.
@@ -1930,55 +1895,182 @@ inline void inv_pfa_butterfly(double* data, std::uint32_t n) {
 }
 
 // -----------------------------------------------------------------------------
-// Forward radix-2^2 cascade (cache-blocked). Runs DIF passes from length
-// `len_start` down to the tail. `n` is the per-branch FFT size; data points
-// to that branch's buffer.
+// Iterative cache-oblivious radix-2^2 cascades.
+//
+// The leaf is the original cache-blocked mechanism: 256 complex points for even
+// log sizes, 512 for odd, with 16/8-point tail kernels.  The outer traversal is
+// linearized DFS.  Forward runs ancestor DIF passes when a block begins an
+// aligned subtree; inverse runs ancestor DIT passes when a block completes one.
 // -----------------------------------------------------------------------------
 
-inline void fwd_cascade(double* data, std::uint32_t n, const plan& pl,
-                        std::uint32_t len_start, unsigned lg_len_start)
+FFT_INLINE std::uint32_t cascade_block_complex(std::uint32_t n, unsigned lgn) {
+    std::uint32_t blk = 256u << (lgn & 1u);
+    return blk < n ? blk : n;
+}
+
+FFT_INLINE std::uint32_t cascade_tail_complex(unsigned lgn) {
+    return 16u >> (lgn & 1u);
+}
+
+FFT_INLINE unsigned stage_lg_at_or_below(unsigned lg, unsigned lg_limit) {
+    if (lg > lg_limit) lg = lg_limit;
+    if ((lg ^ lg_limit) & 1u) {
+        assert(lg != 0);
+        --lg;
+    }
+    return lg;
+}
+
+#ifndef INT_FFT_ITER_CASCADE_MIN_COMPLEX
+#  define INT_FFT_ITER_CASCADE_MIN_COMPLEX (1u << 16)
+#endif
+
+FFT_INLINE bool use_iter_cascade(const plan& pl, std::uint32_t len_start) {
+    return pl.M == 1u && len_start >= INT_FFT_ITER_CASCADE_MIN_COMPLEX;
+}
+
+inline void fwd_cascade_leaf(double* data, const plan& pl,
+                             std::uint32_t start, std::uint32_t span,
+                             std::uint32_t cur_start,
+                             std::uint32_t tail_blk,
+                             const double* tw16)
+{
+    for (std::uint32_t cur = cur_start; cur > tail_blk; cur >>= 2)
+        fwd_range(data, start, start + span, cur, stage_tw(pl, ctz_u32(cur)));
+    fwd_tail_range(data, start, start + span, tw16);
+}
+
+inline void fwd_cascade_stage_major(double* data, std::uint32_t n,
+                                    const plan& pl,
+                                    std::uint32_t len_start,
+                                    unsigned lg_len_start)
 {
     unsigned lgn = ctz_u32(n);
-    std::uint32_t blk = 256u << (lgn & 1u);
-    std::uint32_t tail_blk = 16u >> (lgn & 1u);
+    std::uint32_t blk = cascade_block_complex(n, lgn);
+    std::uint32_t tail_blk = cascade_tail_complex(lgn);
     const double* tw16 = stage_tw_if_present(pl, 4);
-
-    if (blk > n) blk = n;
 
     std::uint32_t len = len_start;
     unsigned lg_len = lg_len_start;
     for (; len > blk; len >>= 2, lg_len -= 2u)
         fwd_range(data, 0, n, len, stage_tw(pl, lg_len));
 
+    for (std::uint32_t base = 0; base < n; base += blk)
+        fwd_cascade_leaf(data, pl, base, blk, len, tail_blk, tw16);
+}
+
+inline void fwd_cascade_iter(double* data, std::uint32_t n, const plan& pl,
+                             std::uint32_t len_start, unsigned lg_len_start)
+{
+    unsigned lgn = ctz_u32(n);
+    std::uint32_t blk = cascade_block_complex(n, lgn);
+    std::uint32_t tail_blk = cascade_tail_complex(lgn);
+    const double* tw16 = stage_tw_if_present(pl, 4);
+
+    std::uint32_t leaf_cur = len_start;
+    while (leaf_cur > blk) leaf_cur >>= 2;
+    unsigned leaf_lg = ctz_u32(leaf_cur);
+
     for (std::uint32_t base = 0; base < n; base += blk) {
-        std::uint32_t cur = len;
-        unsigned cur_lg = lg_len;
-        for (; cur > tail_blk; cur >>= 2, cur_lg -= 2u)
-            fwd_range(data, base, base + blk, cur, stage_tw(pl, cur_lg));
-        fwd_tail_range(data, base, base + blk, tw16);
+        unsigned max_lg = base == 0 ? lg_len_start
+                                    : stage_lg_at_or_below(ctz_u32(base), lg_len_start);
+        for (unsigned lg = max_lg; lg > leaf_lg; lg -= 2u) {
+            std::uint32_t len = std::uint32_t(1) << lg;
+            fwd_range(data, base, base + len, len, stage_tw(pl, lg));
+        }
+        fwd_cascade_leaf(data, pl, base, blk, leaf_cur, tail_blk, tw16);
     }
 }
 
-// -----------------------------------------------------------------------------
-// Inverse radix-2^2 cascade (cache-blocked). Mirror of fwd_cascade.
-// -----------------------------------------------------------------------------
+inline void fwd_cascade(double* data, std::uint32_t n, const plan& pl,
+                        std::uint32_t len_start, unsigned lg_len_start)
+{
+    assert((len_start & (len_start - 1u)) == 0);
+    assert((n % len_start) == 0);
+    assert(ctz_u32(len_start) == lg_len_start);
 
-inline void inv_cascade(double* data, std::uint32_t n, const plan& pl) {
+    if (use_iter_cascade(pl, len_start))
+        fwd_cascade_iter(data, n, pl, len_start, lg_len_start);
+    else
+        fwd_cascade_stage_major(data, n, pl, len_start, lg_len_start);
+}
+
+inline void inv_cascade_leaf(double* data, const plan& pl,
+                             std::uint32_t start, std::uint32_t span,
+                             std::uint32_t cur_stop,
+                             std::uint32_t tail_blk,
+                             const double* tw16)
+{
+    inv_tail_range(data, start, start + span, tw16);
+    for (std::uint32_t cur = tail_blk << 2; cur <= cur_stop; cur <<= 2)
+        inv_range(data, start, start + span, cur, stage_tw(pl, ctz_u32(cur)));
+}
+
+inline void inv_cascade_stage_major(double* data, std::uint32_t n,
+                                    const plan& pl,
+                                    std::uint32_t len_start,
+                                    unsigned lg_len_start)
+{
     unsigned lgn = ctz_u32(n);
-    std::uint32_t blk = 256u << (lgn & 1u);
-    std::uint32_t tail_blk = 16u >> (lgn & 1u);
+    std::uint32_t blk = cascade_block_complex(n, lgn);
+    std::uint32_t tail_blk = cascade_tail_complex(lgn);
     const double* tw16 = stage_tw_if_present(pl, 4);
 
-    if (blk > n) blk = n;
+    std::uint32_t leaf_cur = len_start;
+    while (leaf_cur > blk) leaf_cur >>= 2;
+
+    for (std::uint32_t base = 0; base < n; base += blk)
+        inv_cascade_leaf(data, pl, base, blk, leaf_cur, tail_blk, tw16);
+
+    for (std::uint32_t len = leaf_cur << 2; len <= len_start; len <<= 2)
+        inv_range(data, 0, n, len, stage_tw(pl, ctz_u32(len)));
+}
+
+inline void inv_cascade_iter(double* data, std::uint32_t n, const plan& pl,
+                             std::uint32_t len_start, unsigned lg_len_start)
+{
+    unsigned lgn = ctz_u32(n);
+    std::uint32_t blk = cascade_block_complex(n, lgn);
+    std::uint32_t tail_blk = cascade_tail_complex(lgn);
+    const double* tw16 = stage_tw_if_present(pl, 4);
+
+    std::uint32_t leaf_cur = len_start;
+    while (leaf_cur > blk) leaf_cur >>= 2;
+    unsigned leaf_lg = ctz_u32(leaf_cur);
 
     for (std::uint32_t base = 0; base < n; base += blk) {
-        inv_tail_range(data, base, base + blk, tw16);
-        for (std::uint32_t cur = tail_blk << 2; cur <= blk; cur <<= 2)
-            inv_range(data, base, base + blk, cur, stage_tw(pl, ctz_u32(cur)));
-    }
+        inv_cascade_leaf(data, pl, base, blk, leaf_cur, tail_blk, tw16);
 
-    for (std::uint32_t len = blk << 2; len <= n; len <<= 2)
-        inv_range(data, 0, n, len, stage_tw(pl, ctz_u32(len)));
+        std::uint32_t end = base + blk;
+        unsigned max_lg = stage_lg_at_or_below(ctz_u32(end), lg_len_start);
+        for (unsigned lg = leaf_lg + 2u; lg <= max_lg; lg += 2u) {
+            std::uint32_t len = std::uint32_t(1) << lg;
+            inv_range(data, end - len, end, len, stage_tw(pl, lg));
+        }
+    }
+}
+
+inline void inv_cascade(double* data, std::uint32_t n, const plan& pl,
+                        std::uint32_t len_start, unsigned lg_len_start)
+{
+    assert((len_start & (len_start - 1u)) == 0);
+    assert((n % len_start) == 0);
+    assert(ctz_u32(len_start) == lg_len_start);
+
+    if (use_iter_cascade(pl, len_start))
+        inv_cascade_iter(data, n, pl, len_start, lg_len_start);
+    else
+        inv_cascade_stage_major(data, n, pl, len_start, lg_len_start);
+}
+
+inline void inv_cascade(double* data, std::uint32_t n, const plan& pl) {
+    inv_cascade(data, n, pl, n, ctz_u32(n));
+}
+
+inline void inv_cascade_children_for_final(double* data, std::uint32_t n,
+                                           const plan& pl)
+{
+    inv_cascade(data, n, pl, n >> 2, ctz_u32(n) - 2u);
 }
 
 // -----------------------------------------------------------------------------
@@ -2551,9 +2643,8 @@ inline void pointwise_sqr(double* data, std::uint32_t n, const plan& pl) {
 // -----------------------------------------------------------------------------
 // Limb recovery from PQ FFT output. The inverse FFT leaves each tile as 4
 // pairs of (even_digit, odd_digit) in double form; we clip negatives, round
-// via the 2^52 magic, merge even + (odd << 16) in 64 bits, then group two
-// pairs into one __int128 partial (low 64 = sum of 32-bit halves, high 64 =
-// carry) and propagate the carry chain across limbs.
+// via the 2^52 magic, merge each pair, then group two pairs into one
+// __int128 partial and propagate the carry chain across limbs.
 // -----------------------------------------------------------------------------
 
 FFT_INLINE void u64_to_i128x2(unsigned __int128 part[2], __m256i u_i) {
@@ -2590,6 +2681,57 @@ FFT_INLINE void cv_to_i128x2(unsigned __int128 part[2], cv x,
     u64_to_i128x2(part, u_i);
 }
 
+FFT_INLINE void u16wide_to_i128x2(unsigned __int128 part[2],
+                                  __m256i re_i, __m256i im_i)
+{
+    const __m256i even_mask = _mm256_setr_epi64x(-1, 0, -1, 0);
+    const __m256i one_mask  = _mm256_setr_epi64x( 1, 0,  1, 0);
+    const __m256i sign_mask = _mm256_set1_epi64x(0x8000000000000000ULL);
+
+    __m256i im_lo_shift = _mm256_slli_epi64(im_i, 16);
+    __m256i pair_lo = _mm256_add_epi64(re_i, im_lo_shift);
+    __m256i pair_carry_cmp =
+        _mm256_cmpgt_epi64(_mm256_xor_si256(re_i, sign_mask),
+                           _mm256_xor_si256(pair_lo, sign_mask));
+    __m256i pair_carry = _mm256_and_si256(pair_carry_cmp, _mm256_set1_epi64x(1));
+    __m256i pair_hi = _mm256_add_epi64(_mm256_srli_epi64(im_i, 48), pair_carry);
+
+    __m256i even_lo = _mm256_and_si256(pair_lo, even_mask);
+    __m256i even_hi = _mm256_and_si256(pair_hi, even_mask);
+    __m256i odd_lo_dup = _mm256_permute4x64_epi64(pair_lo, 0xF5);
+    __m256i odd_hi_dup = _mm256_permute4x64_epi64(pair_hi, 0xF5);
+
+    __m256i odd_lo_low = _mm256_and_si256(_mm256_slli_epi64(odd_lo_dup, 32), even_mask);
+    __m256i odd_lo_high = _mm256_and_si256(_mm256_srli_epi64(odd_lo_dup, 32), even_mask);
+    __m256i odd_hi_high = _mm256_and_si256(_mm256_slli_epi64(odd_hi_dup, 32), even_mask);
+
+    __m256i sum_lo = _mm256_add_epi64(even_lo, odd_lo_low);
+    __m256i carry_cmp =
+        _mm256_cmpgt_epi64(_mm256_xor_si256(even_lo, sign_mask),
+                           _mm256_xor_si256(sum_lo, sign_mask));
+    __m256i carry64 = _mm256_and_si256(carry_cmp, one_mask);
+    __m256i sum_hi = _mm256_add_epi64(even_hi, odd_lo_high);
+    sum_hi = _mm256_add_epi64(sum_hi, odd_hi_high);
+    sum_hi = _mm256_add_epi64(sum_hi, carry64);
+
+    alignas(32) std::uint64_t lo_tmp[4];
+    alignas(32) std::uint64_t hi_tmp[4];
+    _mm256_store_si256(reinterpret_cast<__m256i*>(lo_tmp), sum_lo);
+    _mm256_store_si256(reinterpret_cast<__m256i*>(hi_tmp), sum_hi);
+    part[0] = (unsigned __int128)lo_tmp[0] + ((unsigned __int128)hi_tmp[0] << 64);
+    part[1] = (unsigned __int128)lo_tmp[2] + ((unsigned __int128)hi_tmp[2] << 64);
+}
+
+FFT_INLINE void cv_to_i128x2_wide(unsigned __int128 part[2], cv x,
+                                  vec4 zero, __m256i bias_bits, vec4 bias52)
+{
+    x.re = _mm256_max_pd(x.re, zero);
+    x.im = _mm256_max_pd(x.im, zero);
+    __m256i re_i = _mm256_sub_epi64(_mm256_castpd_si256(add(x.re, bias52)), bias_bits);
+    __m256i im_i = _mm256_sub_epi64(_mm256_castpd_si256(add(x.im, bias52)), bias_bits);
+    u16wide_to_i128x2(part, re_i, im_i);
+}
+
 FFT_INLINE void store_partial_tile(unsigned __int128* partial,
                                    std::size_t result_limbs,
                                    std::size_t tile_idx, cv x,
@@ -2600,6 +2742,22 @@ FFT_INLINE void store_partial_tile(unsigned __int128* partial,
 
     unsigned __int128 part[2];
     cv_to_i128x2(part, x, zero, bias_bits, bias52);
+    partial[limb_idx] = part[0];
+    if (limb_idx + 1u < result_limbs)
+        partial[limb_idx + 1u] = part[1];
+}
+
+FFT_INLINE void store_partial_tile_wide(unsigned __int128* partial,
+                                        std::size_t result_limbs,
+                                        std::size_t tile_idx, cv x,
+                                        vec4 zero, __m256i bias_bits,
+                                        vec4 bias52)
+{
+    std::size_t limb_idx = tile_idx << 1;
+    if (limb_idx >= result_limbs) return;
+
+    unsigned __int128 part[2];
+    cv_to_i128x2_wide(part, x, zero, bias_bits, bias52);
     partial[limb_idx] = part[0];
     if (limb_idx + 1u < result_limbs)
         partial[limb_idx + 1u] = part[1];
@@ -2645,6 +2803,43 @@ inline void inv_final_range_to_partial(unsigned __int128* partial,
     }
 }
 
+FFT_INLINE void store_raw_i64_tile(std::int64_t* raw,
+                                   std::size_t raw_tiles,
+                                   std::size_t tile_idx,
+                                   cv x);
+
+inline void inv_final_range_to_raw_i64(std::int64_t* raw,
+                                       std::size_t raw_tiles,
+                                       double* data, std::uint32_t n,
+                                       const double* tw)
+{
+    std::uint32_t l = n >> 2;
+    std::uint32_t blocks = l >> 2;
+    std::size_t tile_stride = 2u * std::size_t(l);
+
+    const double* twp = tw;
+    double* p0 = tile_at(data, 0);
+    double* p1 = p0 + tile_stride;
+    double* p2 = p1 + tile_stride;
+    double* p3 = p2 + tile_stride;
+
+    for (std::uint32_t t = 0; t < blocks; ++t) {
+        cv w1 = { load(twp + 0), load(twp + 4)  };
+        cv w2 = { load(twp + 8), load(twp + 12) };
+
+        cv o0, o1, o2, o3;
+        r22_dit_eval(o0, o1, o2, o3, p0, p1, p2, p3, w1, w2);
+
+        store_raw_i64_tile(raw, raw_tiles, t,              o0);
+        store_raw_i64_tile(raw, raw_tiles, blocks + t,     o1);
+        store_raw_i64_tile(raw, raw_tiles, 2u*blocks + t,  o2);
+        store_raw_i64_tile(raw, raw_tiles, 3u*blocks + t,  o3);
+
+        p0 += 8; p1 += 8; p2 += 8; p3 += 8;
+        twp += 16;
+    }
+}
+
 inline int carry_partials(std::uint64_t* rp, const unsigned __int128* partial,
                           std::size_t result_limbs)
 {
@@ -2654,6 +2849,182 @@ inline int carry_partials(std::uint64_t* rp, const unsigned __int128* partial,
         rp[i] = std::uint64_t(carry);
         carry >>= 64;
     }
+    return carry == 0;
+}
+
+FFT_INLINE __m256i round_signed_pd_to_i64(vec4 x)
+{
+    const __m256i magic_bits = _mm256_set1_epi64x(0x4338000000000000ULL);
+    const vec4 magic = _mm256_castsi256_pd(magic_bits);
+    return _mm256_sub_epi64(_mm256_castpd_si256(add(x, magic)), magic_bits);
+}
+
+FFT_INLINE void store_raw_i64_tile(std::int64_t* raw,
+                                   std::size_t raw_tiles,
+                                   std::size_t tile_idx,
+                                   cv x)
+{
+    if (tile_idx >= raw_tiles) return;
+    _mm256_store_si256(reinterpret_cast<__m256i*>(raw + 8u * tile_idx + 0u),
+                       round_signed_pd_to_i64(x.re));
+    _mm256_store_si256(reinterpret_cast<__m256i*>(raw + 8u * tile_idx + 4u),
+                       round_signed_pd_to_i64(x.im));
+}
+
+FFT_INLINE __m256i prefix_sum8_i32(__m256i x)
+{
+    x = _mm256_add_epi32(x, _mm256_slli_si256(x, 4));
+    x = _mm256_add_epi32(x, _mm256_slli_si256(x, 8));
+    const __m256i lane3 = _mm256_permutevar8x32_epi32(
+        x, _mm256_setr_epi32(3, 3, 3, 3, 3, 3, 3, 3));
+    const __m256i upper = _mm256_setr_epi32(0, 0, 0, 0, -1, -1, -1, -1);
+    return _mm256_add_epi32(x, _mm256_and_si256(lane3, upper));
+}
+
+FFT_INLINE __m256i valid8_i32(std::int32_t base, std::uint32_t len)
+{
+    const __m256i idx = _mm256_add_epi32(_mm256_set1_epi32(base),
+                                         _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
+    const __m256i ge0 = _mm256_cmpgt_epi32(idx, _mm256_set1_epi32(-1));
+    const __m256i lt_len = _mm256_cmpgt_epi32(_mm256_set1_epi32(std::int32_t(len)), idx);
+    return _mm256_and_si256(_mm256_and_si256(ge0, lt_len), _mm256_set1_epi32(1));
+}
+
+FFT_INLINE __m256i load8_u16_digits_i32(const std::uint64_t* src,
+                                        std::uint32_t digit_count,
+                                        std::int32_t digit_idx)
+{
+    if (digit_idx >= 0 && (digit_idx & 3) == 0 &&
+        std::uint32_t(digit_idx) + 8u <= digit_count) {
+        std::size_t limb_idx = std::size_t(std::uint32_t(digit_idx) >> 2);
+        __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + limb_idx));
+        return _mm256_cvtepu16_epi32(v);
+    }
+
+    alignas(32) std::uint32_t tmp[8] = {};
+    for (unsigned i = 0; i < 8u; ++i) {
+        std::int32_t d = digit_idx + std::int32_t(i);
+        if (d >= 0 && std::uint32_t(d) < digit_count) {
+            std::uint64_t limb = src[std::uint32_t(d) >> 2];
+            tmp[i] = std::uint32_t((limb >> (16u * (std::uint32_t(d) & 3u))) & 0xffffu);
+        }
+    }
+    return _mm256_load_si256(reinterpret_cast<const __m256i*>(tmp));
+}
+
+FFT_INLINE __m256i even_i32_to_i64(__m256i x)
+{
+    const __m256i even = _mm256_permutevar8x32_epi32(
+        x, _mm256_setr_epi32(0, 2, 4, 6, 0, 0, 0, 0));
+    return _mm256_cvtepi32_epi64(_mm256_castsi256_si128(even));
+}
+
+FFT_INLINE __m256i odd_i32_to_i64(__m256i x)
+{
+    const __m256i odd = _mm256_permutevar8x32_epi32(
+        x, _mm256_setr_epi32(1, 3, 5, 7, 0, 0, 0, 0));
+    return _mm256_cvtepi32_epi64(_mm256_castsi256_si128(odd));
+}
+
+FFT_INLINE __m256i carry_u64(__m256i a, __m256i sum)
+{
+    const __m256i sign = _mm256_set1_epi64x(0x8000000000000000ULL);
+    return _mm256_srli_epi64(
+        _mm256_cmpgt_epi64(_mm256_xor_si256(a, sign),
+                           _mm256_xor_si256(sum, sign)),
+        63);
+}
+
+FFT_INLINE void u16_coeffs_to_i128x2(unsigned __int128 part[2],
+                                     __m256i even_coeff,
+                                     __m256i odd_coeff)
+{
+    const __m256i qlo = _mm256_add_epi64(even_coeff,
+                                         _mm256_slli_epi64(odd_coeff, 16));
+    const __m256i qhi = _mm256_add_epi64(_mm256_srli_epi64(odd_coeff, 48),
+                                         carry_u64(even_coeff, qlo));
+
+    const __m256i qlo_odd = _mm256_permute4x64_epi64(qlo, 0xF5);
+    const __m256i qhi_odd = _mm256_permute4x64_epi64(qhi, 0xF5);
+
+    const __m256i plo = _mm256_add_epi64(qlo, _mm256_slli_epi64(qlo_odd, 32));
+    __m256i phi = _mm256_add_epi64(qhi, _mm256_srli_epi64(qlo_odd, 32));
+    phi = _mm256_add_epi64(phi, _mm256_slli_epi64(qhi_odd, 32));
+    phi = _mm256_add_epi64(phi, carry_u64(qlo, plo));
+
+    const __m256i out = _mm256_unpacklo_epi64(plo, phi);
+    alignas(32) std::uint64_t tmp[4];
+    _mm256_store_si256(reinterpret_cast<__m256i*>(tmp), out);
+    part[0] = (unsigned __int128)tmp[0] + ((unsigned __int128)tmp[1] << 64);
+    part[1] = (unsigned __int128)tmp[2] + ((unsigned __int128)tmp[3] << 64);
+}
+
+inline int centered_u16_raw_to_limbs(std::uint64_t* rp,
+                                     const std::int64_t* raw,
+                                     const std::uint64_t* ap,
+                                     std::ptrdiff_t an,
+                                     const std::uint64_t* bp,
+                                     std::ptrdiff_t bn)
+{
+    const std::uint32_t na = 4u * std::uint32_t(an);
+    const std::uint32_t nb = 4u * std::uint32_t(bn);
+    const std::size_t result_limbs = std::size_t(an + bn);
+    const std::size_t result_tiles = (result_limbs + 1u) >> 1;
+    std::int64_t S = 0;
+    std::int64_t C = 0;
+    unsigned __int128 carry = 0;
+
+    for (std::size_t t = 0; t < result_tiles; ++t) {
+        std::int32_t k = std::int32_t(8u * t);
+
+        __m256i add_a = load8_u16_digits_i32(ap, na, k);
+        __m256i add_b = load8_u16_digits_i32(bp, nb, k);
+        __m256i drop_a = load8_u16_digits_i32(ap, na, k - std::int32_t(nb));
+        __m256i drop_b = load8_u16_digits_i32(bp, nb, k - std::int32_t(na));
+        __m256i dS = _mm256_sub_epi32(_mm256_add_epi32(add_a, add_b),
+                                      _mm256_add_epi32(drop_a, drop_b));
+        __m256i prefS = prefix_sum8_i32(dS);
+
+        __m256i dC = _mm256_sub_epi32(valid8_i32(k, na),
+                                      valid8_i32(k - std::int32_t(nb), na));
+        __m256i prefC = prefix_sum8_i32(dC);
+
+        __m256i Se = _mm256_add_epi64(even_i32_to_i64(prefS), _mm256_set1_epi64x(S));
+        __m256i So = _mm256_add_epi64(odd_i32_to_i64(prefS),  _mm256_set1_epi64x(S));
+        __m256i Ce = _mm256_add_epi64(even_i32_to_i64(prefC), _mm256_set1_epi64x(C));
+        __m256i Co = _mm256_add_epi64(odd_i32_to_i64(prefC),  _mm256_set1_epi64x(C));
+
+        S += std::int32_t(_mm256_extract_epi32(prefS, 7));
+        C += std::int32_t(_mm256_extract_epi32(prefC, 7));
+
+        __m256i corr_e = _mm256_sub_epi64(_mm256_slli_epi64(Se, 15),
+                                          _mm256_slli_epi64(Ce, 30));
+        __m256i corr_o = _mm256_sub_epi64(_mm256_slli_epi64(So, 15),
+                                          _mm256_slli_epi64(Co, 30));
+
+        __m256i e = _mm256_add_epi64(
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(raw + 8u * t + 0u)),
+            corr_e);
+        __m256i o = _mm256_add_epi64(
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(raw + 8u * t + 4u)),
+            corr_o);
+
+        unsigned __int128 part[2];
+        u16_coeffs_to_i128x2(part, e, o);
+
+        std::size_t limb = t << 1;
+        if (limb < result_limbs) {
+            carry += part[0];
+            rp[limb] = std::uint64_t(carry);
+            carry >>= 64;
+        }
+        if (limb + 1u < result_limbs) {
+            carry += part[1];
+            rp[limb + 1u] = std::uint64_t(carry);
+            carry >>= 64;
+        }
+    }
+
     return carry == 0;
 }
 
@@ -2674,62 +3045,163 @@ FFT_INLINE int U16Codec::partial_to_limbs(std::uint64_t* rp,
     return carry_partials(rp, partial, result_limbs);
 }
 
-FFT_INLINE void RuntimeBitsCodec::emit_tile(unsigned __int128* partial,
-                                            std::size_t partial_n,
-                                            std::size_t tile_idx, cv x,
-                                            vec4 zero, __m256i bias_bits,
-                                            vec4 bias52) const
+FFT_INLINE void U16WideCodec::emit_tile(unsigned __int128* partial,
+                                        std::size_t partial_n,
+                                        std::size_t tile_idx, cv x,
+                                        vec4 zero, __m256i bias_bits,
+                                        vec4 bias52) const
+{
+    store_partial_tile_wide(partial, partial_n, tile_idx, x, zero, bias_bits, bias52);
+}
+
+FFT_INLINE int U16WideCodec::partial_to_limbs(std::uint64_t* rp,
+                                              const unsigned __int128* partial,
+                                              std::size_t partial_n,
+                                              std::size_t result_limbs) const
+{
+    (void)partial_n;
+    return carry_partials(rp, partial, result_limbs);
+}
+
+template <unsigned Bits>
+FFT_INLINE void FixedBitsCodec<Bits>::emit_tile(unsigned __int128* partial,
+                                                std::size_t partial_n,
+                                                std::size_t tile_idx, cv x,
+                                                vec4 zero, __m256i bias_bits,
+                                                vec4 bias52) const
 {
     x.re = _mm256_max_pd(x.re, zero);
     x.im = _mm256_max_pd(x.im, zero);
     __m256i re_i = _mm256_sub_epi64(_mm256_castpd_si256(add(x.re, bias52)), bias_bits);
     __m256i im_i = _mm256_sub_epi64(_mm256_castpd_si256(add(x.im, bias52)), bias_bits);
 
-    alignas(32) std::uint64_t re[4];
-    alignas(32) std::uint64_t im[4];
-    _mm256_store_si256(reinterpret_cast<__m256i*>(re), re_i);
-    _mm256_store_si256(reinterpret_cast<__m256i*>(im), im_i);
-
-    unsigned __int128 p0 = (unsigned __int128)re[0]
-                         + ((unsigned __int128)im[0] << trunk_bits);
-    unsigned __int128 p1 = (unsigned __int128)re[1]
-                         + ((unsigned __int128)im[1] << trunk_bits);
-    unsigned __int128 p2 = (unsigned __int128)re[2]
-                         + ((unsigned __int128)im[2] << trunk_bits);
-    unsigned __int128 p3 = (unsigned __int128)re[3]
-                         + ((unsigned __int128)im[3] << trunk_bits);
+    unsigned __int128 p0 = (unsigned __int128)extract_u64_lane<0>(re_i)
+                         + ((unsigned __int128)extract_u64_lane<0>(im_i) << Bits);
+    unsigned __int128 p1 = (unsigned __int128)extract_u64_lane<1>(re_i)
+                         + ((unsigned __int128)extract_u64_lane<1>(im_i) << Bits);
+    unsigned __int128 p2 = (unsigned __int128)extract_u64_lane<2>(re_i)
+                         + ((unsigned __int128)extract_u64_lane<2>(im_i) << Bits);
+    unsigned __int128 p3 = (unsigned __int128)extract_u64_lane<3>(re_i)
+                         + ((unsigned __int128)extract_u64_lane<3>(im_i) << Bits);
 
     std::size_t group_idx = tile_idx << 1;
     if (group_idx < partial_n)
-        partial[group_idx] = p0 + (p1 << pair_bits);
+        partial[group_idx] = p0 + (p1 << pair_width);
     if (group_idx + 1u < partial_n)
-        partial[group_idx + 1u] = p2 + (p3 << pair_bits);
+        partial[group_idx + 1u] = p2 + (p3 << pair_width);
 }
 
-FFT_INLINE int RuntimeBitsCodec::partial_to_limbs(std::uint64_t* rp,
-                                                  const unsigned __int128* partial,
-                                                  std::size_t partial_n,
-                                                  std::size_t result_limbs) const
+template <unsigned Bits>
+FFT_INLINE int FixedBitsCodec<Bits>::partial_to_limbs(std::uint64_t* rp,
+                                                      const unsigned __int128* partial,
+                                                      std::size_t partial_n,
+                                                      std::size_t result_limbs) const
 {
-    std::memset(rp, 0, result_limbs * sizeof(std::uint64_t));
-
-    const std::uint64_t group_mask = low_mask_u64(group_bits);
     unsigned __int128 carry = 0;
-    for (std::size_t i = 0; i < partial_n; ++i) {
-        carry += partial[i];
-        std::uint64_t chunk = std::uint64_t(carry) & group_mask;
-        carry >>= group_bits;
+    std::size_t i = 0;
+    std::size_t limb = 0;
 
-        std::size_t bit = i * group_bits;
-        std::size_t limb = bit >> 6;
-        if (limb >= result_limbs)
-            continue;
+    auto next_chunk = [&]() {
+        carry += partial[i++];
+        std::uint64_t chunk = std::uint64_t(carry) & group_mask_fixed;
+        carry >>= group_width;
+        return chunk;
+    };
 
-        unsigned shift = unsigned(bit & 63u);
-        rp[limb] |= chunk << shift;
-        if (shift != 0u && limb + 1u < result_limbs)
-            rp[limb + 1u] |= chunk >> (64u - shift);
+    if constexpr (Bits == 15u) {
+        while (i + 16u <= partial_n && limb + 15u <= result_limbs) {
+            std::uint64_t c0  = next_chunk();
+            std::uint64_t c1  = next_chunk();
+            std::uint64_t c2  = next_chunk();
+            std::uint64_t c3  = next_chunk();
+            std::uint64_t c4  = next_chunk();
+            std::uint64_t c5  = next_chunk();
+            std::uint64_t c6  = next_chunk();
+            std::uint64_t c7  = next_chunk();
+            std::uint64_t c8  = next_chunk();
+            std::uint64_t c9  = next_chunk();
+            std::uint64_t c10 = next_chunk();
+            std::uint64_t c11 = next_chunk();
+            std::uint64_t c12 = next_chunk();
+            std::uint64_t c13 = next_chunk();
+            std::uint64_t c14 = next_chunk();
+            std::uint64_t c15 = next_chunk();
+            rp[limb++] = c0        | (c1  << 60);
+            rp[limb++] = (c1  >> 4)  | (c2  << 56);
+            rp[limb++] = (c2  >> 8)  | (c3  << 52);
+            rp[limb++] = (c3  >> 12) | (c4  << 48);
+            rp[limb++] = (c4  >> 16) | (c5  << 44);
+            rp[limb++] = (c5  >> 20) | (c6  << 40);
+            rp[limb++] = (c6  >> 24) | (c7  << 36);
+            rp[limb++] = (c7  >> 28) | (c8  << 32);
+            rp[limb++] = (c8  >> 32) | (c9  << 28);
+            rp[limb++] = (c9  >> 36) | (c10 << 24);
+            rp[limb++] = (c10 >> 40) | (c11 << 20);
+            rp[limb++] = (c11 >> 44) | (c12 << 16);
+            rp[limb++] = (c12 >> 48) | (c13 << 12);
+            rp[limb++] = (c13 >> 52) | (c14 << 8);
+            rp[limb++] = (c14 >> 56) | (c15 << 4);
+        }
+    } else if constexpr (Bits == 14u) {
+        while (i + 8u <= partial_n && limb + 7u <= result_limbs) {
+            std::uint64_t c0 = next_chunk();
+            std::uint64_t c1 = next_chunk();
+            std::uint64_t c2 = next_chunk();
+            std::uint64_t c3 = next_chunk();
+            std::uint64_t c4 = next_chunk();
+            std::uint64_t c5 = next_chunk();
+            std::uint64_t c6 = next_chunk();
+            std::uint64_t c7 = next_chunk();
+            rp[limb++] = c0        | (c1 << 56);
+            rp[limb++] = (c1 >> 8)  | (c2 << 48);
+            rp[limb++] = (c2 >> 16) | (c3 << 40);
+            rp[limb++] = (c3 >> 24) | (c4 << 32);
+            rp[limb++] = (c4 >> 32) | (c5 << 24);
+            rp[limb++] = (c5 >> 40) | (c6 << 16);
+            rp[limb++] = (c6 >> 48) | (c7 << 8);
+        }
     }
+
+    std::uint64_t acc = 0;
+    unsigned fill = 0;
+
+    for (; i < partial_n; ++i) {
+        carry += partial[i];
+        std::uint64_t chunk = std::uint64_t(carry) & group_mask_fixed;
+        carry >>= group_width;
+
+        if (fill == 0u) {
+            acc = chunk;
+            fill = group_width;
+            continue;
+        }
+
+        acc |= chunk << fill;
+        unsigned used = 64u - fill;
+        if (group_width >= used) {
+            if (limb < result_limbs)
+                rp[limb] = acc;
+            ++limb;
+
+            if (group_width == used) {
+                acc = 0;
+                fill = 0;
+            } else {
+                acc = chunk >> used;
+                fill = group_width - used;
+            }
+        } else {
+            fill += group_width;
+        }
+    }
+
+    if (fill != 0u) {
+        if (limb < result_limbs)
+            rp[limb] = acc;
+        ++limb;
+    }
+    while (limb < result_limbs)
+        rp[limb++] = 0;
     return carry == 0;
 }
 
@@ -2762,22 +3234,7 @@ inline int inv_recover_pow2(std::uint64_t* rp, double* data, std::uint32_t n,
     if constexpr (Codec::needs_partial_clear)
         std::memset(ws.partial, 0, partial_n * sizeof(unsigned __int128));
 
-    unsigned lgn = ctz_u32(n);
-    std::uint32_t blk = 256u << (lgn & 1u);
-    std::uint32_t tail_blk = 16u >> (lgn & 1u);
-    const double* tw16 = stage_tw_if_present(pl, 4);
-
-    if (blk > n) blk = n;
-
-    for (std::uint32_t base = 0; base < n; base += blk) {
-        inv_tail_range(data, base, base + blk, tw16);
-        for (std::uint32_t cur = tail_blk << 2; cur <= blk && cur < n; cur <<= 2)
-            inv_range(data, base, base + blk, cur, stage_tw(pl, ctz_u32(cur)));
-    }
-
-    for (std::uint32_t len = blk << 2; len < n; len <<= 2)
-        inv_range(data, 0, n, len, stage_tw(pl, ctz_u32(len)));
-
+    inv_cascade_children_for_final(data, n, pl);
     inv_final_range_to_partial(ws.partial, partial_n, data, n,
                                stage_tw(pl, ctz_u32(n)), io);
     return io.partial_to_limbs(rp, ws.partial, partial_n, result_limbs);
@@ -2860,6 +3317,107 @@ inline int inv_recover_pfa(std::uint64_t* rp, double* data, std::uint32_t n,
     return io.partial_to_limbs(rp, ws.partial, partial_n, result_limbs);
 }
 
+inline int inv_recover_centered_pow2(std::uint64_t* rp,
+                                     double* data,
+                                     std::uint32_t n,
+                                     const plan& pl,
+                                     const std::uint64_t* ap,
+                                     std::ptrdiff_t an,
+                                     const std::uint64_t* bp,
+                                     std::ptrdiff_t bn)
+{
+    std::size_t result_limbs = std::size_t(an + bn);
+    std::size_t raw_tiles = (result_limbs + 1u) >> 1;
+    std::int64_t* raw = reinterpret_cast<std::int64_t*>(data);
+
+    if (n < 32u) {
+        inv(data, n, pl);
+        std::uint32_t tiles = (n + 3u) >> 2;
+        for (std::uint32_t t = 0; t < tiles; ++t)
+            store_raw_i64_tile(raw, raw_tiles, t, load_cv(data + 8u * t));
+    } else {
+        inv_cascade_children_for_final(data, n, pl);
+        inv_final_range_to_raw_i64(raw, raw_tiles, data, n,
+                                   stage_tw(pl, ctz_u32(n)));
+    }
+
+    return centered_u16_raw_to_limbs(rp, raw, ap, an, bp, bn);
+}
+
+template <std::uint32_t M>
+inline void inv_pfa_butterfly_to_raw(std::int64_t* raw,
+                                     std::size_t raw_tiles,
+                                     double* data, std::uint32_t n)
+{
+    static_assert(M == 3 || M == 5 || M == 7, "PFA M must be 3, 5, or 7");
+
+    std::uint32_t n4 = n >> 2;
+    std::uint32_t phi_step = n % M;
+    alignas(32) std::uint32_t P_init[8] = {};
+    std::uint32_t phi = 0;
+    for (std::uint32_t b = 0; b < M; ++b) {
+        P_init[phi] = 2u * n * b;
+        phi += phi_step;
+        if (phi >= M) phi -= M;
+    }
+    __m256i V = _mm256_load_si256(reinterpret_cast<const __m256i*>(P_init));
+    const __m256i rot = rot_idx_v<M>();
+    const __m256i bump = _mm256_set1_epi32(8);
+
+    double* p[M];
+    for (std::uint32_t i = 0; i < M; ++i)
+        p[i] = data + 2u * std::size_t(n) * i;
+
+    for (std::uint32_t t = 0; t < n4; ++t) {
+        cv x[M];
+        for (std::uint32_t i = 0; i < M; ++i) {
+            x[i] = load_cv(p[i]);
+            p[i] += 8;
+        }
+
+        cv y[M];
+        pfa_butterfly_inv<M>(x, y);
+
+        cv out[M];
+        pfa_shuffle_inv<M>(out, y);
+
+        alignas(32) std::uint32_t P[8];
+        _mm256_store_si256(reinterpret_cast<__m256i*>(P), V);
+        for (std::uint32_t i = 0; i < M; ++i)
+            store_raw_i64_tile(raw, raw_tiles, std::size_t(P[i] >> 3), out[i]);
+
+        V = _mm256_add_epi32(V, bump);
+        V = _mm256_permutevar8x32_epi32(V, rot);
+    }
+}
+
+inline int inv_recover_centered_pfa(std::uint64_t* rp,
+                                    double* data,
+                                    std::uint32_t n,
+                                    const plan& pl,
+                                    workspace& ws,
+                                    const std::uint64_t* ap,
+                                    std::ptrdiff_t an,
+                                    const std::uint64_t* bp,
+                                    std::ptrdiff_t bn)
+{
+    std::size_t result_limbs = std::size_t(an + bn);
+    std::size_t raw_tiles = (result_limbs + 1u) >> 1;
+    std::int64_t* raw = reinterpret_cast<std::int64_t*>(ws.data2);
+
+    for (std::uint32_t b = 0; b < pl.M; ++b)
+        inv_cascade(data + 2u * std::size_t(n) * b, n, pl);
+
+    switch (pl.M) {
+        case 3: inv_pfa_butterfly_to_raw<3>(raw, raw_tiles, data, n); break;
+        case 5: inv_pfa_butterfly_to_raw<5>(raw, raw_tiles, data, n); break;
+        case 7: inv_pfa_butterfly_to_raw<7>(raw, raw_tiles, data, n); break;
+        default: assert(!"invalid PFA M"); return 0;
+    }
+
+    return centered_u16_raw_to_limbs(rp, raw, ap, an, bp, bn);
+}
+
 // -----------------------------------------------------------------------------
 // Thread-local singletons.
 // -----------------------------------------------------------------------------
@@ -2890,7 +3448,20 @@ struct trunk_fft_size { fft_size fs; unsigned trunk_bits; };
 constexpr std::uint32_t MAX_U16_TRANSFORM_N = 1u << 16;
 constexpr std::uint32_t MAX_U15_TRANSFORM_N = 1u << 19;
 constexpr std::uint32_t MAX_U14_TRANSFORM_N = 1u << 21;
-constexpr std::uint32_t MAX_U13_TRANSFORM_N = 1u << 23;
+#ifndef INT_FFT_U16_WIDE_MAX_TRANSFORM_N
+#  define INT_FFT_U16_WIDE_MAX_TRANSFORM_N (1u << 17)
+#endif
+constexpr std::uint32_t MAX_U16_WIDE_TRANSFORM_N =
+    INT_FFT_U16_WIDE_MAX_TRANSFORM_N <= MAX_U14_TRANSFORM_N
+        ? INT_FFT_U16_WIDE_MAX_TRANSFORM_N
+        : MAX_U14_TRANSFORM_N;
+#ifndef INT_FFT_U16_CENTERED_MAX_TRANSFORM_N
+#  define INT_FFT_U16_CENTERED_MAX_TRANSFORM_N MAX_U15_TRANSFORM_N
+#endif
+constexpr std::uint32_t MAX_U16_CENTERED_TRANSFORM_N =
+    INT_FFT_U16_CENTERED_MAX_TRANSFORM_N <= MAX_U14_TRANSFORM_N
+        ? INT_FFT_U16_CENTERED_MAX_TRANSFORM_N
+        : MAX_U14_TRANSFORM_N;
 
 inline bool digits_for_limbs(std::ptrdiff_t limbs, unsigned trunk_bits,
                              std::uint32_t& digits)
@@ -2909,7 +3480,7 @@ FFT_INLINE std::uint32_t max_transform_for_trunk_bits(unsigned trunk_bits) {
     if (trunk_bits >= 16u) return MAX_U16_TRANSFORM_N;
     if (trunk_bits == 15u) return MAX_U15_TRANSFORM_N;
     if (trunk_bits == 14u) return MAX_U14_TRANSFORM_N;
-    return MAX_U13_TRANSFORM_N;
+    return 0;
 }
 
 inline fft_size choose_fft_size(std::uint32_t needed) {
@@ -2927,7 +3498,7 @@ inline fft_size choose_fft_size(std::uint32_t needed) {
 inline bool choose_trunk_fft_size(std::ptrdiff_t an, std::ptrdiff_t bn,
                                   trunk_fft_size& out)
 {
-    for (unsigned bits : { 16u, 15u, 14u, 13u }) {
+    for (unsigned bits : { 14u }) {
         std::uint32_t na = 0, nb = 0;
         if (!digits_for_limbs(an, bits, na) ||
             !digits_for_limbs(bn, bits, nb))
@@ -2939,6 +3510,103 @@ inline bool choose_trunk_fft_size(std::ptrdiff_t an, std::ptrdiff_t bn,
         }
     }
     return false;
+}
+
+template <class Codec>
+inline int mul_with_codec(std::uint64_t* rp,
+                          const std::uint64_t* ap, std::ptrdiff_t an,
+                          const std::uint64_t* bp, std::ptrdiff_t bn,
+                          const fft_size& fs, const Codec& io)
+{
+    ensure(pl, fs.n_branch);
+    pl.M = fs.M;
+    ensure(ws, fs.N_full);
+
+    fwd(ws.data,  ap, std::size_t(an), fs.n_branch, pl, io);
+    fwd(ws.data2, bp, std::size_t(bn), fs.n_branch, pl, io);
+
+    pointwise_mul(ws.data, ws.data2, fs.n_branch, pl);
+    if (pl.M == 1u)
+        return inv_recover_pow2(rp, ws.data, fs.n_branch, pl, ws, an, bn, io);
+    return inv_recover_pfa(rp, ws.data, fs.n_branch, pl, ws, an, bn, io);
+}
+
+template <class Codec>
+inline int sqr_with_codec(std::uint64_t* rp,
+                          const std::uint64_t* ap, std::ptrdiff_t an,
+                          const fft_size& fs, const Codec& io)
+{
+    ensure(pl, fs.n_branch);
+    pl.M = fs.M;
+    ensure(ws, fs.N_full);
+
+    fwd(ws.data, ap, std::size_t(an), fs.n_branch, pl, io);
+    pointwise_sqr(ws.data, fs.n_branch, pl);
+    if (pl.M == 1u)
+        return inv_recover_pow2(rp, ws.data, fs.n_branch, pl, ws, an, an, io);
+    return inv_recover_pfa(rp, ws.data, fs.n_branch, pl, ws, an, an, io);
+}
+
+inline int mul_centered_u16(std::uint64_t* rp,
+                            const std::uint64_t* ap, std::ptrdiff_t an,
+                            const std::uint64_t* bp, std::ptrdiff_t bn,
+                            const fft_size& fs)
+{
+    ensure(pl, fs.n_branch);
+    pl.M = fs.M;
+    ensure(ws, fs.N_full);
+    CenteredU16Codec io;
+
+    fwd(ws.data,  ap, std::size_t(an), fs.n_branch, pl, io);
+    fwd(ws.data2, bp, std::size_t(bn), fs.n_branch, pl, io);
+
+    pointwise_mul(ws.data, ws.data2, fs.n_branch, pl);
+    if (pl.M == 1u)
+        return inv_recover_centered_pow2(rp, ws.data, fs.n_branch, pl,
+                                         ap, an, bp, bn);
+    return inv_recover_centered_pfa(rp, ws.data, fs.n_branch, pl, ws,
+                                    ap, an, bp, bn);
+}
+
+inline int sqr_centered_u16(std::uint64_t* rp,
+                            const std::uint64_t* ap, std::ptrdiff_t an,
+                            const fft_size& fs)
+{
+    ensure(pl, fs.n_branch);
+    pl.M = fs.M;
+    ensure(ws, fs.N_full);
+    CenteredU16Codec io;
+
+    fwd(ws.data, ap, std::size_t(an), fs.n_branch, pl, io);
+    pointwise_sqr(ws.data, fs.n_branch, pl);
+    if (pl.M == 1u)
+        return inv_recover_centered_pow2(rp, ws.data, fs.n_branch, pl,
+                                         ap, an, ap, an);
+    return inv_recover_centered_pfa(rp, ws.data, fs.n_branch, pl, ws,
+                                    ap, an, ap, an);
+}
+
+inline int mul_runtime_bits(std::uint64_t* rp,
+                            const std::uint64_t* ap, std::ptrdiff_t an,
+                            const std::uint64_t* bp, std::ptrdiff_t bn,
+                            const fft_size& fs, unsigned trunk_bits)
+{
+    switch (trunk_bits) {
+        case 15u: { U15Codec io; return mul_with_codec(rp, ap, an, bp, bn, fs, io); }
+        case 14u: { U14Codec io; return mul_with_codec(rp, ap, an, bp, bn, fs, io); }
+        default: return 0;
+    }
+}
+
+inline int sqr_runtime_bits(std::uint64_t* rp,
+                            const std::uint64_t* ap, std::ptrdiff_t an,
+                            const fft_size& fs, unsigned trunk_bits)
+{
+    switch (trunk_bits) {
+        case 15u: { U15Codec io; return sqr_with_codec(rp, ap, an, fs, io); }
+        case 14u: { U14Codec io; return sqr_with_codec(rp, ap, an, fs, io); }
+        default: return 0;
+    }
 }
 }  // namespace
 
@@ -3004,18 +3672,7 @@ int fft::mul_bits(std::uint64_t* rp,
     fft_size fs = choose_fft_size((na + nb + 1u) >> 1);
     if (fs.N_full > max_transform_for_trunk_bits(trunk_bits)) return 0;
 
-    ensure(pl, fs.n_branch);
-    pl.M = fs.M;
-    ensure(ws, fs.N_full);
-    RuntimeBitsCodec io(trunk_bits);
-
-    fwd(ws.data,  ap, std::size_t(an), fs.n_branch, pl, io);
-    fwd(ws.data2, bp, std::size_t(bn), fs.n_branch, pl, io);
-
-    pointwise_mul(ws.data, ws.data2, fs.n_branch, pl);
-    if (pl.M == 1u)
-        return inv_recover_pow2(rp, ws.data, fs.n_branch, pl, ws, an, bn, io);
-    return inv_recover_pfa(rp, ws.data, fs.n_branch, pl, ws, an, bn, io);
+    return mul_runtime_bits(rp, ap, an, bp, bn, fs, trunk_bits);
 }
 
 int fft::sqr_bits(std::uint64_t* rp,
@@ -3034,16 +3691,7 @@ int fft::sqr_bits(std::uint64_t* rp,
     fft_size fs = choose_fft_size(na);
     if (fs.N_full > max_transform_for_trunk_bits(trunk_bits)) return 0;
 
-    ensure(pl, fs.n_branch);
-    pl.M = fs.M;
-    ensure(ws, fs.N_full);
-    RuntimeBitsCodec io(trunk_bits);
-
-    fwd(ws.data, ap, std::size_t(an), fs.n_branch, pl, io);
-    pointwise_sqr(ws.data, fs.n_branch, pl);
-    if (pl.M == 1u)
-        return inv_recover_pow2(rp, ws.data, fs.n_branch, pl, ws, an, an, io);
-    return inv_recover_pfa(rp, ws.data, fs.n_branch, pl, ws, an, an, io);
+    return sqr_runtime_bits(rp, ap, an, fs, trunk_bits);
 }
 
 int fft::mul_auto(std::uint64_t* rp,
@@ -3052,25 +3700,25 @@ int fft::mul_auto(std::uint64_t* rp,
 {
     if (an <= 0 || bn <= 0) return 0;
 
+    std::uint32_t na = 0, nb = 0;
+    if (!digits_for_limbs(an, 16u, na) ||
+        !digits_for_limbs(bn, 16u, nb))
+        return 0;
+    fft_size fs16 = choose_fft_size((na + nb + 1u) >> 1);
+    if (fs16.N_full <= MAX_U16_TRANSFORM_N)
+        return fft::mul(rp, ap, an, bp, bn);
+    if (fs16.N_full <= MAX_U16_WIDE_TRANSFORM_N) {
+        U16WideCodec io;
+        return mul_with_codec(rp, ap, an, bp, bn, fs16, io);
+    }
+    if (fs16.N_full <= MAX_U16_CENTERED_TRANSFORM_N)
+        return mul_centered_u16(rp, ap, an, bp, bn, fs16);
+
     trunk_fft_size ts;
     if (!choose_trunk_fft_size(an, bn, ts))
         return 0;
 
-    if (ts.trunk_bits == 16u)
-        return fft::mul(rp, ap, an, bp, bn);
-
-    ensure(pl, ts.fs.n_branch);
-    pl.M = ts.fs.M;
-    ensure(ws, ts.fs.N_full);
-    RuntimeBitsCodec io(ts.trunk_bits);
-
-    fwd(ws.data,  ap, std::size_t(an), ts.fs.n_branch, pl, io);
-    fwd(ws.data2, bp, std::size_t(bn), ts.fs.n_branch, pl, io);
-
-    pointwise_mul(ws.data, ws.data2, ts.fs.n_branch, pl);
-    if (pl.M == 1u)
-        return inv_recover_pow2(rp, ws.data, ts.fs.n_branch, pl, ws, an, bn, io);
-    return inv_recover_pfa(rp, ws.data, ts.fs.n_branch, pl, ws, an, bn, io);
+    return mul_runtime_bits(rp, ap, an, bp, bn, ts.fs, ts.trunk_bits);
 }
 
 int fft::sqr_auto(std::uint64_t* rp,
@@ -3078,23 +3726,24 @@ int fft::sqr_auto(std::uint64_t* rp,
 {
     if (an <= 0) return 0;
 
+    std::uint32_t na = 0;
+    if (!digits_for_limbs(an, 16u, na))
+        return 0;
+    fft_size fs16 = choose_fft_size(na);
+    if (fs16.N_full <= MAX_U16_TRANSFORM_N)
+        return fft::sqr(rp, ap, an);
+    if (fs16.N_full <= MAX_U16_WIDE_TRANSFORM_N) {
+        U16WideCodec io;
+        return sqr_with_codec(rp, ap, an, fs16, io);
+    }
+    if (fs16.N_full <= MAX_U16_CENTERED_TRANSFORM_N)
+        return sqr_centered_u16(rp, ap, an, fs16);
+
     trunk_fft_size ts;
     if (!choose_trunk_fft_size(an, an, ts))
         return 0;
 
-    if (ts.trunk_bits == 16u)
-        return fft::sqr(rp, ap, an);
-
-    ensure(pl, ts.fs.n_branch);
-    pl.M = ts.fs.M;
-    ensure(ws, ts.fs.N_full);
-    RuntimeBitsCodec io(ts.trunk_bits);
-
-    fwd(ws.data, ap, std::size_t(an), ts.fs.n_branch, pl, io);
-    pointwise_sqr(ws.data, ts.fs.n_branch, pl);
-    if (pl.M == 1u)
-        return inv_recover_pow2(rp, ws.data, ts.fs.n_branch, pl, ws, an, an, io);
-    return inv_recover_pfa(rp, ws.data, ts.fs.n_branch, pl, ws, an, an, io);
+    return sqr_runtime_bits(rp, ap, an, ts.fs, ts.trunk_bits);
 }
 
 #endif  // INT_FFT_IMPLEMENTATION
